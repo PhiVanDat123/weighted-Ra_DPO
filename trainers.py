@@ -152,6 +152,229 @@ def tisdpo_loss(chosen_logps_margin: torch.FloatTensor,
     return losses, chosen_rewards, rejected_rewards
 
 
+def radpo_loss(chosen_logps_margin: torch.FloatTensor,
+               rejected_logps_margin: torch.FloatTensor,
+               chosen_position_risk_ratio: torch.FloatTensor,
+               rejected_position_risk_ratio: torch.FloatTensor,
+               beta: float, alpha: float = 0.5, if_radpo2: bool = False) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
+    """Compute the Ra-DPO loss for a batch of policy and reference model log probabilities.
+
+    Args:
+        chosen_logps_margin: The difference of log probabilities between the policy model and the reference model for the chosen responses. Shape: (batch_size,)
+        rejected_logps_margin: The difference of log probabilities between the policy model and the reference model for the rejected responses. Shape: (batch_size,)
+        chosen_position_risk_ratio: The difference of sequential risk_ratio divergence between the policy model and the reference model for the chosen responses. Shape: (batch_size,)
+        rejected_position_risk_ratio: The difference of sequential risk_ratio divergence between the policy model and the reference model for the rejected responses. Shape: (batch_size,)
+        beta: Temperature parameter for the Ra-DPO loss, typically something in the range of 0.1 to 0.5. We ignore the reference model as beta -> 0.
+        alpha: Temperature parameter for the Ra-DPO loss, used to adjust the impact of sequential risk_ratio divergence.
+        if_radpo2: Determine whether to use method Ra-DPO2, default is False; if True, then use method Ra-DPO2 instead of Ra-DPO1.
+
+    Returns:
+        A tuple of three tensors: (losses, chosen_rewards, rejected_rewards).
+        The losses tensor contains the Ra-DPO loss for each example in the batch.
+        The rewards tensors contain the rewards for response pair. 
+    """
+    chosen_values = chosen_logps_margin + chosen_position_risk_ratio
+    rejected_values = rejected_logps_margin + rejected_position_risk_ratio
+
+    chosen_rejected_logps_margin = chosen_logps_margin - rejected_logps_margin
+
+    if not if_radpo2:
+        # Ra-DPO1
+        logits = chosen_rejected_logps_margin - (rejected_position_risk_ratio - chosen_position_risk_ratio)   
+    else:
+        # Ra-DPO2
+        logits = chosen_rejected_logps_margin - alpha * (rejected_position_risk_ratio - chosen_position_risk_ratio.detach()) 
+    
+    losses = -F.logsigmoid(beta * logits)
+
+    chosen_rewards = beta * chosen_values.detach()
+    rejected_rewards = beta * rejected_values.detach()
+
+    return losses, chosen_rewards, rejected_rewards
+
+
+def _radpo_get_batch_logps(logits: torch.FloatTensor, reference_logits: torch.FloatTensor, labels: torch.LongTensor, weights: torch.FloatTensor=None,
+                           confidence_level: float = 0.5, is_split_risk_ratio: bool = True, 
+                           is_cal_risk_distribution_logps: bool = False, average_log_prob: bool = False):
+    """Compute the kl divergence/log probabilities/risk ratio of the given labels under the given logits.
+
+    Args:
+        logits: Logits of the model (unnormalized). Shape: (batch_size, sequence_length, vocab_size)
+        reference_logits: Logits of the reference model (unnormalized). Shape: (batch_size, sequence_length, vocab_size)
+        labels: Labels for which to compute the log probabilities. Label tokens with a value of -100 are ignored. Shape: (batch_size, sequence_length)
+        confidence_level: Confidence level for CVaR calculation.
+        is_split_risk_ratio: Whether to split the risk ratio calculation for chosen and rejected.
+        is_cal_risk_distribution_logps: Whether to calculate risk distribution logps.
+        average_log_prob: If True, return the average log probability per (non-masked) token.
+
+    Returns:
+        Several tensors of shape (batch_size,) containing the average/sum kl divergence/log probabilities/risk ratio of the given labels under the given logits.
+    """
+    assert logits.shape[:-1] == labels.shape
+    assert reference_logits.shape[:-1] == labels.shape
+
+    labels = labels[:, 1:].clone()
+    logits = logits[:, :-1, :]
+    reference_logits = reference_logits[:, :-1, :]
+
+    loss_mask = (labels != -100)
+
+    # dummy token; we'll ignore the losses on these tokens later
+    labels[labels == -100] = 0
+
+    distribution_logps = logits.float().log_softmax(-1) 
+    
+    reference_distribution_ps = reference_logits.float().softmax(-1)
+    reference_distribution_logps = reference_distribution_ps.log()
+
+    per_position_kl = (reference_distribution_ps * (reference_distribution_logps - distribution_logps)).sum(-1)
+    
+    if not is_cal_risk_distribution_logps:
+        per_position_risk_ratio = _calculate_cvar(reference_distribution_logps, distribution_logps, 
+                                                   reference_distribution_ps, confidence_level, 
+                                                   is_split_risk_ratio).sum(-1)
+    else:
+        per_position_risk_ratio, _, _ = _cal_risk_distribution_logps(reference_distribution_logps, distribution_logps, 
+                                                                      reference_distribution_ps, confidence_level, 
+                                                                      is_split_risk_ratio)
+        per_position_risk_ratio = per_position_risk_ratio.sum(-1)
+
+    per_token_logps = torch.gather(distribution_logps, dim=2, index=labels.unsqueeze(2)).squeeze(2)
+    per_reference_token_logps = torch.gather(reference_distribution_logps, dim=2, index=labels.unsqueeze(2)).squeeze(2)
+
+    logps_margin = per_token_logps - per_reference_token_logps
+    weights = weights[:, 1:].clone()
+
+    if average_log_prob:
+        return (logps_margin * weights * loss_mask).sum(-1) / loss_mask.sum(-1), \
+               (per_position_kl * weights * loss_mask).sum(-1) / loss_mask.sum(-1), \
+               (per_position_risk_ratio * loss_mask).sum(-1) / loss_mask.sum(-1), \
+               (per_token_logps * weights * loss_mask).sum(-1) / loss_mask.sum(-1)
+    else:
+        return (logps_margin * weights * loss_mask).sum(-1), \
+            (per_position_kl * weights * loss_mask).sum(-1), \
+            (per_position_risk_ratio * loss_mask).sum(-1), \
+            (per_token_logps * weights * loss_mask).sum(-1)
+
+
+def _calculate_cvar(reference_distribution, distribution, probabilities, confidence_level, is_split_risk_ratio=True):
+    """Calculate CVaR (Conditional Value at Risk) for Ra-DPO.
+    
+    Args:
+        reference_distribution: Log probabilities from reference model
+        distribution: Log probabilities from policy model  
+        probabilities: Probabilities from reference model
+        confidence_level: Confidence level for quantile calculation
+        is_split_risk_ratio: Whether to split calculation for chosen and rejected
+        
+    Returns:
+        CVaR tensor
+    """
+    distribution = reference_distribution - distribution
+    
+    if is_split_risk_ratio:
+        mid_index = distribution.size(2) // 2
+
+        chosen_distribution, rejected_distribution = distribution[:, :, :mid_index], distribution[:, :, mid_index:]
+        chosen_probabilities, rejected_probabilities = probabilities[:, :, :mid_index], probabilities[:, :, mid_index:]
+
+        chosen_VaR = torch.quantile(chosen_distribution, 1-confidence_level, dim=2).unsqueeze(-1)
+        rejected_VaR = torch.quantile(rejected_distribution, 1-confidence_level, dim=2).unsqueeze(-1)
+
+        chosen_mask = chosen_distribution > chosen_VaR 
+        rejected_mask = rejected_distribution > rejected_VaR
+
+        chosen_weighted_losses_above_VaR = chosen_probabilities * chosen_distribution * chosen_mask.float()
+        rejected_weighted_losses_above_VaR = rejected_probabilities * rejected_distribution * rejected_mask.float()
+
+        CVaR = torch.cat((chosen_weighted_losses_above_VaR, rejected_weighted_losses_above_VaR), dim=2)
+    else:
+        VaR = torch.quantile(distribution, 1-confidence_level, dim=2).unsqueeze(-1)
+        mask = distribution > VaR 
+        weighted_losses_above_VaR = probabilities * distribution * mask.float()
+        CVaR = weighted_losses_above_VaR
+
+    return CVaR
+
+
+def _cal_risk_distribution_logps(reference_distribution_logps, distribution_logps, probabilities, confidence_level, is_split_risk_ratio=True):
+    """Calculate risk distribution log probabilities for Ra-DPO.
+    
+    Args:
+        reference_distribution_logps: Log probabilities from reference model
+        distribution_logps: Log probabilities from policy model
+        probabilities: Probabilities from reference model
+        confidence_level: Confidence level for quantile calculation
+        is_split_risk_ratio: Whether to split calculation for chosen and rejected
+        
+    Returns:
+        Tuple of (CVaR, reference_distribution_logps_risk, distribution_logps_risk)
+    """
+    if is_split_risk_ratio:
+        mid_index = distribution_logps.size(2) // 2
+        
+        # split
+        chosen_reference_distribution_logps, rejected_reference_distribution_logps = reference_distribution_logps[:, :, :mid_index], reference_distribution_logps[:, :, mid_index:]
+        chosen_distribution_logps, rejected_distribution_logps = distribution_logps[:, :, :mid_index], distribution_logps[:, :, mid_index:]
+        
+        # quantile
+        chosen_reference_distribution_logps_quantile = torch.quantile(chosen_reference_distribution_logps, 1-confidence_level, dim=2).unsqueeze(-1)
+        chosen_distribution_logps_quantile = torch.quantile(chosen_distribution_logps, 1-confidence_level, dim=2).unsqueeze(-1)
+        rejected_reference_distribution_logps_quantile = torch.quantile(rejected_reference_distribution_logps, 1-confidence_level, dim=2).unsqueeze(-1)
+        rejected_distribution_logps_quantile = torch.quantile(rejected_distribution_logps, 1-confidence_level, dim=2).unsqueeze(-1)
+
+        # mask
+        chosen_reference_distribution_logps_mask = chosen_reference_distribution_logps > chosen_reference_distribution_logps_quantile
+        chosen_distribution_logps_mask = chosen_distribution_logps > chosen_distribution_logps_quantile 
+        rejected_reference_distribution_logps_mask = rejected_reference_distribution_logps > rejected_reference_distribution_logps_quantile
+        rejected_distribution_logps_mask = rejected_distribution_logps > rejected_distribution_logps_quantile
+
+        # VaR
+        chosen_reference_distribution_logps_VaR = chosen_reference_distribution_logps_quantile * chosen_reference_distribution_logps_mask.float()
+        chosen_distribution_logps_VaR = chosen_distribution_logps_quantile * chosen_distribution_logps_mask.float()
+        rejected_reference_distribution_logps_VaR = rejected_reference_distribution_logps_quantile * rejected_reference_distribution_logps_mask.float()
+        rejected_distribution_logps_VaR = rejected_distribution_logps_quantile * rejected_distribution_logps_mask.float()
+         
+        # cal chosen_distribution & rejected_distribution
+        chosen_distribution = chosen_reference_distribution_logps_VaR - chosen_distribution_logps_VaR
+        rejected_distribution = rejected_reference_distribution_logps_VaR - rejected_distribution_logps_VaR
+
+        # cal reference_distribution_logps_risk & distribution_logps_risk
+        reference_distribution_logps_risk = torch.cat((chosen_reference_distribution_logps_VaR, rejected_reference_distribution_logps_VaR), dim=2)
+        distribution_logps_risk = torch.cat((chosen_distribution_logps_VaR, rejected_distribution_logps_VaR), dim=2)
+
+        # split chosen_probabilities & rejected_probabilities
+        chosen_probabilities, rejected_probabilities = probabilities[:, :, :mid_index], probabilities[:, :, mid_index:]
+
+        chosen_weighted_losses_above_VaR = chosen_probabilities * chosen_distribution
+        rejected_weighted_losses_above_VaR = rejected_probabilities * rejected_distribution
+
+        CVaR = torch.cat((chosen_weighted_losses_above_VaR, rejected_weighted_losses_above_VaR), dim=2)
+    else:
+        # quantile
+        reference_distribution_logps_quantile = torch.quantile(reference_distribution_logps, 1-confidence_level, dim=2).unsqueeze(-1)
+        distribution_logps_quantile = torch.quantile(distribution_logps, 1-confidence_level, dim=2).unsqueeze(-1)
+       
+        # mask
+        reference_distribution_logps_mask = reference_distribution_logps > reference_distribution_logps_quantile
+        distribution_logps_mask = distribution_logps > distribution_logps_quantile 
+
+        # VaR
+        reference_distribution_logps_VaR = reference_distribution_logps_quantile * reference_distribution_logps_mask.float()
+        distribution_logps_VaR = distribution_logps_quantile * distribution_logps_mask.float()
+        
+        # cal distribution
+        distribution = reference_distribution_logps_VaR - distribution_logps_VaR
+
+        # cal reference_distribution_logps_risk & distribution_logps_risk
+        reference_distribution_logps_risk = reference_distribution_logps_VaR
+        distribution_logps_risk = distribution_logps_VaR
+
+        weighted_losses_above_VaR = probabilities * distribution
+        CVaR = weighted_losses_above_VaR
+
+    return CVaR, reference_distribution_logps_risk, distribution_logps_risk
+
 
 def preference_loss(policy_chosen_logps: torch.FloatTensor,
                     policy_rejected_logps: torch.FloatTensor,
@@ -366,7 +589,7 @@ class BasicTrainer(object):
             policy_output = self.policy.generate(
                 batch['prompt_input_ids'], attention_mask=batch['prompt_attention_mask'], max_length=self.config.max_length, do_sample=True, pad_token_id=self.tokenizer.pad_token_id)
 
-        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
+        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'radpo'}:
             ctx = lambda: (FSDP.summon_full_params(self.reference_model, writeback=False, recurse=False) if 'FSDP' in self.config.trainer else contextlib.nullcontext())
             with ctx():
                 reference_output = self.reference_model.generate(
@@ -376,7 +599,7 @@ class BasicTrainer(object):
         policy_output = all_gather_if_needed(policy_output, self.rank, self.world_size)
         policy_output_decoded = self.tokenizer.batch_decode(policy_output, skip_special_tokens=True)
 
-        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
+        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'radpo'}:
             reference_output = pad_to_length(reference_output, self.config.max_length, self.tokenizer.pad_token_id)
             reference_output = all_gather_if_needed(reference_output, self.rank, self.world_size)
             reference_output_decoded = self.tokenizer.batch_decode(reference_output, skip_special_tokens=True)
@@ -453,6 +676,44 @@ class BasicTrainer(object):
 
         return chosen_logps_margin, rejected_logps_margin, chosen_position_kl, rejected_position_kl, \
             chosen_logps, rejected_logps
+
+    def radpo_concatenated_forward(self, model: nn.Module, reference_model: nn.Module,
+                                  batch: Dict[str, Union[List, torch.LongTensor]]):
+        """Run the policy model and the reference model on the given batch of inputs, concatenating the chosen and rejected inputs together.
+
+           We do this to avoid doing two forward passes, because it's faster for FSDP.
+        """
+        concatenated_batch = concatenated_inputs(batch)
+        all_logits = model(concatenated_batch['concatenated_input_ids'],
+                           attention_mask=concatenated_batch['concatenated_attention_mask']).logits.to(torch.float32)
+        
+        with torch.no_grad():
+            reference_all_logits = reference_model(concatenated_batch['concatenated_input_ids'],
+                                                   attention_mask=concatenated_batch[
+                                                       'concatenated_attention_mask']).logits.to(torch.float32)
+        
+        all_logps_margin, all_position_kl, all_position_risk_ratio, all_logps = _radpo_get_batch_logps(
+            all_logits, reference_all_logits, concatenated_batch['concatenated_labels'], concatenated_batch['concatenated_weight'],
+            confidence_level=self.config.loss.confidence_level,
+            is_split_risk_ratio=self.config.loss.is_split_risk_ratio,
+            is_cal_risk_distribution_logps=self.config.loss.is_cal_risk_distribution_logps,
+            average_log_prob=False
+        )
+
+        chosen_logps_margin = all_logps_margin[:batch['chosen_input_ids'].shape[0]]
+        rejected_logps_margin = all_logps_margin[batch['chosen_input_ids'].shape[0]:]
+        
+        chosen_position_kl = all_position_kl[:batch['chosen_input_ids'].shape[0]]
+        rejected_position_kl = all_position_kl[batch['chosen_input_ids'].shape[0]:]
+
+        chosen_position_risk_ratio = all_position_risk_ratio[:batch['chosen_input_ids'].shape[0]]
+        rejected_position_risk_ratio = all_position_risk_ratio[batch['chosen_input_ids'].shape[0]:]
+
+        chosen_logps = all_logps[:batch['chosen_input_ids'].shape[0]].detach()
+        rejected_logps = all_logps[batch['chosen_input_ids'].shape[0]:].detach()
+
+        return chosen_logps_margin, rejected_logps_margin, chosen_position_kl, rejected_position_kl, \
+            chosen_position_risk_ratio, rejected_position_risk_ratio, chosen_logps, rejected_logps
 
 
     def get_batch_metrics(self, batch: Dict[str, Union[List, torch.LongTensor]], loss_config: DictConfig, train=True):
@@ -544,6 +805,45 @@ class BasicTrainer(object):
             policy_rejected_logps = all_gather_if_needed(policy_rejected_logps.detach(), self.rank, self.world_size)
             metrics[f'logps_{train_test}/rejected'] = policy_rejected_logps.cpu().numpy().tolist()
 
+        elif loss_config.name == 'radpo':
+            chosen_logps_margin, rejected_logps_margin, chosen_position_kl, rejected_position_kl, \
+                chosen_position_risk_ratio, rejected_position_risk_ratio, policy_chosen_logps, policy_rejected_logps \
+                = self.radpo_concatenated_forward(self.policy, self.reference_model, batch)
+            
+            losses, chosen_rewards, rejected_rewards = radpo_loss(
+                chosen_logps_margin, rejected_logps_margin,
+                chosen_position_risk_ratio, rejected_position_risk_ratio,
+                beta=loss_config.beta, alpha=loss_config.alpha, if_radpo2=loss_config.if_radpo2
+            )
+
+            reward_accuracies = (chosen_rewards > rejected_rewards).float()
+
+            chosen_rewards = all_gather_if_needed(chosen_rewards, self.rank, self.world_size)
+            rejected_rewards = all_gather_if_needed(rejected_rewards, self.rank, self.world_size)
+            reward_accuracies = all_gather_if_needed(reward_accuracies, self.rank, self.world_size)
+
+            metrics[f'rewards_{train_test}/chosen'] = chosen_rewards.cpu().numpy().tolist()
+            metrics[f'rewards_{train_test}/rejected'] = rejected_rewards.cpu().numpy().tolist()
+            metrics[f'rewards_{train_test}/accuracies'] = reward_accuracies.cpu().numpy().tolist()
+            metrics[f'rewards_{train_test}/margins'] = (chosen_rewards - rejected_rewards).cpu().numpy().tolist()
+
+            all_device_chosen_position_kl = all_gather_if_needed(chosen_position_kl.detach(), self.rank, self.world_size)
+            all_device_rejected_position_kl = all_gather_if_needed(rejected_position_kl.detach(), self.rank, self.world_size)
+
+            metrics[f'kl_{train_test}/chosen'] = all_device_chosen_position_kl.cpu().numpy().tolist()
+            metrics[f'kl_{train_test}/rejected'] = all_device_rejected_position_kl.cpu().numpy().tolist()
+            metrics[f'kl_{train_test}/margin'] = (all_device_chosen_position_kl - all_device_rejected_position_kl).cpu().numpy().tolist()
+
+            all_device_chosen_risk_ratio = all_gather_if_needed(chosen_position_risk_ratio.detach(), self.rank, self.world_size)
+            all_device_rejected_risk_ratio = all_gather_if_needed(rejected_position_risk_ratio.detach(), self.rank, self.world_size)
+
+            metrics[f'risk_ratio_{train_test}/chosen'] = all_device_chosen_risk_ratio.cpu().numpy().tolist()
+            metrics[f'risk_ratio_{train_test}/rejected'] = all_device_rejected_risk_ratio.cpu().numpy().tolist()
+            metrics[f'risk_ratio_{train_test}/margin'] = (all_device_chosen_risk_ratio - all_device_rejected_risk_ratio).cpu().numpy().tolist()
+
+            policy_rejected_logps = all_gather_if_needed(policy_rejected_logps.detach(), self.rank, self.world_size)
+            metrics[f'logps_{train_test}/rejected'] = policy_rejected_logps.cpu().numpy().tolist()
+
         elif loss_config.name == 'sft':
             policy_chosen_logits = self.policy(batch['chosen_input_ids'], attention_mask=batch['chosen_attention_mask']).logits.to(torch.float32)
             policy_chosen_logps = _get_batch_logps(policy_chosen_logits, batch['chosen_labels'], average_log_prob=False, token_level=False)
@@ -569,7 +869,7 @@ class BasicTrainer(object):
         np.random.seed(self.seed)
         random.seed(self.seed)
 
-        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
+        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'radpo'}:
             self.reference_model.eval()
 
         self.example_counter = 0
@@ -586,7 +886,7 @@ class BasicTrainer(object):
                 if self.config.sample_during_eval:
                     all_policy_samples, all_reference_samples = [], []
                     policy_text_table = wandb.Table(columns=["step", "prompt", "sample"])
-                    if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
+                    if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'radpo'}:
                         reference_text_table = wandb.Table(columns=["step", "prompt", "sample"])
 
                 for eval_batch in (tqdm.tqdm(self.eval_batches, desc='Computing eval metrics') if self.rank == 0 else self.eval_batches):
@@ -613,7 +913,7 @@ class BasicTrainer(object):
 
                         for prompt, sample in zip(eval_batch['prompt'], policy_samples):
                             policy_text_table.add_data(self.example_counter, prompt, sample)
-                        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
+                        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'radpo'}:
                             for prompt, sample in zip(eval_batch['prompt'], reference_samples):
                                 reference_text_table.add_data(self.example_counter, prompt, sample)
 
@@ -621,7 +921,7 @@ class BasicTrainer(object):
                 rank0_print(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
                 if self.config.sample_during_eval:                    
                     rank0_print(json.dumps(all_policy_samples[:10], indent=2))
-                    if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
+                    if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'radpo'}:
                         rank0_print(json.dumps(all_reference_samples[:10], indent=2))
 
                 if self.config.wandb.enabled and self.rank == 0:
@@ -629,7 +929,7 @@ class BasicTrainer(object):
 
                     if self.config.sample_during_eval:
                         wandb.log({"policy_samples": policy_text_table}, step=self.example_counter)
-                        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
+                        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'radpo'}:
                             wandb.log({"reference_samples": reference_text_table}, step=self.example_counter)
 
             #### END EVALUATION ####
@@ -773,7 +1073,7 @@ class FSDPTrainer(BasicTrainer):
                 apply_activation_checkpointing(self.policy, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn)
                 rank0_print('FSDP activation checkpointing enabled!')
 
-        if config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
+        if config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'radpo'}:
             rank0_print('Sharding reference model...')
             self.reference_model = FSDP(reference_model, **shared_fsdp_kwargs)
         
@@ -834,7 +1134,7 @@ class TensorParallelTrainer(BasicTrainer):
         
         rank0_print('Sharding policy...')
         self.policy = tp.tensor_parallel(policy, sharded=True)
-        if config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
+        if config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'radpo'}:
             rank0_print('Sharding reference model...')
             self.reference_model = tp.tensor_parallel(reference_model, sharded=False)
 

@@ -1,0 +1,27 @@
+# do Ra-DPO (Risk-aware DPO) preference-based training
+name: radpo
+
+# the temperature parameter for Ra-DPO; lower values mean we care less about
+#   the reference model
+beta: 0.1
+
+# alpha parameter for Ra-DPO loss, used to adjust the impact of sequential risk_ratio divergence
+# only used when if_radpo2 is True
+alpha: 0.5
+
+# if true, use Ra-DPO2 method; if false (default), use Ra-DPO1 method
+if_radpo2: false
+
+# confidence level for CVaR (Conditional Value at Risk) calculation
+# typically in range (0, 1), controls the quantile threshold
+confidence_level: 0.5
+
+# whether to split the risk ratio calculation for chosen and rejected responses
+is_split_risk_ratio: true
+
+# whether to calculate risk distribution log probabilities
+# if false, uses standard CVaR calculation
+is_cal_risk_distribution_logps: false
+
+# if true, use a uniform (maximum entropy) reference model
+reference_free: false

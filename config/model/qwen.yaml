@@ -1,7 +1,7 @@
-name_or_path: /workspace/panleyi/models/Qwen/Qwen2.5-3B-sft
+name_or_path: Qwen/Qwen3-1.7B
 tokenizer_name_or_path: null
 archive: null
-block_name: Qwen2DecoderLayer
+block_name: Qwen3DecoderLayer
 
 policy_dtype: float32
 fsdp_policy_mp: null

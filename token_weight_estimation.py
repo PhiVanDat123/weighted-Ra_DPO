@@ -153,8 +153,8 @@ def process_dataset_shard(gpu_id, input_file, model_name_1, model_name_2, model1
     tokenizer.pad_token = tokenizer.eos_token
     
     # Load models to the specific device
-    model_1 = AutoModelForCausalLM.from_pretrained(model_name_1).to(device)
-    model_2 = AutoModelForCausalLM.from_pretrained(model_name_2).to(device)
+    model_1 = AutoModelForCausalLM.from_pretrained(model_name_1, torch_dtype=torch.float32, use_safetensors=True).to(device)
+    model_2 = AutoModelForCausalLM.from_pretrained(model_name_2, torch_dtype=torch.float32, use_safetensors=True).to(device)
     
     prompts1 = [promt_dict[model1_template].format(item['prompt']) for item in data_shard]
     prompts2 = [promt_dict[model2_template].format(item['prompt']) for item in data_shard]
