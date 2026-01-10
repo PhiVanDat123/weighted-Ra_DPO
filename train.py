@@ -118,7 +118,7 @@ def main(config: DictConfig):
         config.model.name_or_path, low_cpu_mem_usage=True, torch_dtype=policy_dtype, **model_kwargs)
     disable_dropout(policy)
 
-    if config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
+    if config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'radpo'}:
         print('building reference model')
         reference_model_dtype = getattr(torch, config.model.reference_dtype)
         reference_model = transformers.AutoModelForCausalLM.from_pretrained(
