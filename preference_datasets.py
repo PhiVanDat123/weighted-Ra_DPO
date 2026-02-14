@@ -99,9 +99,10 @@ def get_dataset(name: str, split: str, silent: bool = False, transform_config=No
 
     """
     transform_method = transform_config.get('method', 'origin')
+    transform_params = transform_config.get('params', {})
     # Get parameters for the specific method
-    if transform_method in transform_config:
-        transform_params = transform_config.get(transform_method, {})
+    #if transform_method in transform_config:
+        #transform_params = transform_config.get(transform_method, {})
 
     def apply_weight_transform(weight_values, negate=False):
         """Helper function to apply weight transformation with the configured parameters"""
@@ -176,7 +177,7 @@ def get_dataset(name: str, split: str, silent: bool = False, transform_config=No
             data[prompt]['pairs'].append((n_responses, n_responses + 1))
             data[prompt]['responses'].extend(responses)
             data[prompt]['sft_target'] = chosen
-            
+            '''
             # Process weights
             data[prompt]['rejected_weight'].append(apply_weight_transform(rejected_weight, negate=False))
             if rejected_weight is None:
@@ -185,7 +186,7 @@ def get_dataset(name: str, split: str, silent: bool = False, transform_config=No
             data[prompt]['chosen_weight'].append(apply_weight_transform(chosen_weight, negate=True))
             if chosen_weight is None:
                 data[prompt]['chosen_weight'] = None
-            
+            '''
     return data
 
 

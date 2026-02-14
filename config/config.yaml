@@ -51,7 +51,7 @@ local_run_dir: ${get_local_run_dir:${exp_name},${output_dir}}
 exp_name: ${build_exp_name:${loss.name},${model.name_or_path},${datasets},${reverse_dataset},${transform}}
 
 # the learning rate
-lr: 5e-7
+lr: 5e-6
 
 # number of steps to accumulate over for each batch
 #   (e.g. if batch_size=4 and gradient_accumulation_steps=2, then we will
@@ -94,8 +94,11 @@ eval_every: 100_000
 # prevent wandb from logging more than once per minimum_log_interval_secs
 minimum_log_interval_secs: 1.0
 
+save_every_epoch: true  # Lưu sau mỗi epoch
+save_every_steps: 0     # 0 = không lưu theo steps, hoặc đặt số như 1000, 5000...
+
 defaults:
 - _self_
 - model: blank_model_fp32 # basic model configuration
 - loss: sft # which loss function, either sft or dpo (specify loss.beta if using dpo)
-- transform: default # which transform configuration to use
+- transform: none # which transform configuration to use

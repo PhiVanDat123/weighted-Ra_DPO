@@ -248,14 +248,26 @@ def _radpo_get_batch_logps(logits: torch.FloatTensor, reference_logits: torch.Fl
     if average_log_prob:
         return (logps_margin * weights * loss_mask).sum(-1) / loss_mask.sum(-1), \
                (per_position_kl * weights * loss_mask).sum(-1) / loss_mask.sum(-1), \
-               (per_position_risk_ratio * loss_mask).sum(-1) / loss_mask.sum(-1), \
+               (per_position_risk_ratio * weights * loss_mask).sum(-1) / loss_mask.sum(-1), \
                (per_token_logps * weights * loss_mask).sum(-1) / loss_mask.sum(-1)
     else:
         return (logps_margin * weights * loss_mask).sum(-1), \
             (per_position_kl * weights * loss_mask).sum(-1), \
-            (per_position_risk_ratio * loss_mask).sum(-1), \
+            (per_position_risk_ratio * weights * loss_mask).sum(-1), \
             (per_token_logps * weights * loss_mask).sum(-1)
-
+    
+    '''
+    if average_log_prob:
+        return (logps_margin * loss_mask).sum(-1) / loss_mask.sum(-1), \
+               (per_position_kl * loss_mask).sum(-1) / loss_mask.sum(-1), \
+               (per_position_risk_ratio * loss_mask).sum(-1) / loss_mask.sum(-1), \
+               (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
+    else:
+        return (logps_margin * loss_mask).sum(-1), \
+            (per_position_kl * loss_mask).sum(-1), \
+            (per_position_risk_ratio * loss_mask).sum(-1), \
+            (per_token_logps * loss_mask).sum(-1)
+    '''
 
 def _calculate_cvar(reference_distribution, distribution, probabilities, confidence_level, is_split_risk_ratio=True):
     """Calculate CVaR (Conditional Value at Risk) for Ra-DPO.
@@ -574,6 +586,21 @@ class BasicTrainer(object):
 
         print(self.transform_config)
         
+        # Đếm số examples thực tế từ dataset trước khi tạo iterator
+        from preference_datasets import get_dataset
+        total_examples = 0
+        for name in config.datasets:
+            dataset = get_dataset(name, 'train', silent=True, cache_dir=None, 
+                                transform_config=transform_config, 
+                                base_data_dir=config.base_data_dir, 
+                                reverse_dataset=config.reverse_dataset)
+            for prompt, data in dataset.items():
+                # Đếm số pairs trong mỗi prompt (mỗi pair là một example)
+                total_examples += len(data.get('pairs', [1]))  # Default 1 nếu không có pairs
+        
+        self.examples_per_epoch = total_examples
+        rank0_print(f'Total examples per epoch: {self.examples_per_epoch}')
+        
         self.train_iterator = get_batch_iterator(**data_iterator_kwargs, split='train', n_epochs=config.n_epochs, n_examples=config.n_examples, batch_size=config.batch_size, silent=rank != 0, transform_config=transform_config)
         rank0_print(f'Loaded train data iterator')
         self.eval_iterator = get_batch_iterator(**data_iterator_kwargs, split='test', n_examples=config.n_eval_examples, batch_size=config.eval_batch_size, silent=rank != 0, transform_config=transform_config)
@@ -864,7 +891,7 @@ class BasicTrainer(object):
         rank0_print(f'Using {self.config.optimizer} optimizer')
         self.optimizer = getattr(torch.optim, self.config.optimizer)(self.policy.parameters(), lr=self.config.lr)
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda step: min(1.0, (step + 1) / (self.config.warmup_steps + 1)))
-    
+
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
         random.seed(self.seed)
@@ -874,12 +901,21 @@ class BasicTrainer(object):
 
         self.example_counter = 0
         self.batch_counter = 0
+        self.current_epoch = 0
         last_log = None
+        last_saved_epoch = 0  # Track epoch đã save (bắt đầu từ 0)
+
+        rank0_print(f'Starting training with {self.examples_per_epoch} examples per epoch')
+        rank0_print(f'save_every_epoch: {self.config.get("save_every_epoch", True)}')
 
         for batch in self.train_iterator:
+            # Cập nhật epoch dựa trên example_counter
+            if self.examples_per_epoch > 0:
+                self.current_epoch = self.example_counter // self.examples_per_epoch
+            
             #### BEGIN EVALUATION ####
             if self.example_counter % self.config.eval_every == 0 and (self.example_counter > 0 or self.config.do_first_eval):
-                rank0_print(f'Running evaluation after {self.example_counter} train examples')
+                rank0_print(f'Running evaluation after {self.example_counter} train examples (Epoch {self.current_epoch})')
                 self.policy.eval()
 
                 all_eval_metrics = defaultdict(list)
@@ -961,11 +997,47 @@ class BasicTrainer(object):
             self.batch_counter += 1
             self.example_counter += self.config.batch_size
 
+            # Lưu checkpoint sau mỗi epoch
+            if self.examples_per_epoch > 0:
+                new_epoch = self.example_counter // self.examples_per_epoch
+                save_every_epoch = self.config.get('save_every_epoch', True) if hasattr(self.config, 'get') else getattr(self.config, 'save_every_epoch', True)
+                
+                if save_every_epoch and new_epoch > last_saved_epoch:
+                    self.current_epoch = new_epoch
+                    rank0_print(f'')
+                    rank0_print(f'{"="*60}')
+                    rank0_print(f'Completed Epoch {new_epoch}')
+                    rank0_print(f'{"="*60}')
+                    rank0_print(f'Saving checkpoint at epoch {new_epoch}, step {self.example_counter}...')
+                    
+                    checkpoint_dir = os.path.join(self.run_dir, f'checkpoint-epoch-{new_epoch}')
+                    mean_train_metrics = {k: sum(v) / len(v) for k, v in batch_metrics.items()}
+                    mean_train_metrics['epoch'] = new_epoch
+                    
+                    self.save(output_dir=checkpoint_dir, metrics=mean_train_metrics)
+                    rank0_print(f'Checkpoint saved to {checkpoint_dir}')
+                    rank0_print(f'{"="*60}')
+                    rank0_print(f'')
+                    
+                    last_saved_epoch = new_epoch
+            
+            # Lưu checkpoint theo steps (optional)
+            save_every_steps = self.config.get('save_every_steps', 0) if hasattr(self.config, 'get') else getattr(self.config, 'save_every_steps', 0)
+            if save_every_steps > 0:
+                if self.example_counter % save_every_steps == 0 and self.example_counter > 0:
+                    rank0_print(f'Saving checkpoint at step {self.example_counter}...')
+                    checkpoint_dir = os.path.join(self.run_dir, f'checkpoint-step-{self.example_counter}')
+                    mean_train_metrics = {k: sum(v) / len(v) for k, v in batch_metrics.items()}
+                    self.save(output_dir=checkpoint_dir, metrics=mean_train_metrics)
+                    rank0_print(f'Checkpoint saved to {checkpoint_dir}')
+
             if last_log is None or time.time() - last_log > self.config.minimum_log_interval_secs:
                 mean_train_metrics = {k: sum(v) / len(v) for k, v in batch_metrics.items()}
                 mean_train_metrics['counters/examples'] = self.example_counter
                 mean_train_metrics['counters/updates'] = self.batch_counter
-                rank0_print(f'train stats after {self.example_counter} examples: {formatted_dict(mean_train_metrics)}')
+                mean_train_metrics['counters/epoch'] = self.current_epoch
+                epoch_progress = (self.example_counter % self.examples_per_epoch) / self.examples_per_epoch * 100 if self.examples_per_epoch > 0 else 0
+                rank0_print(f'train stats after {self.example_counter} examples (Epoch {self.current_epoch}, {epoch_progress:.1f}% complete): {formatted_dict(mean_train_metrics)}')
 
                 if self.config.wandb.enabled and self.rank == 0:
                     wandb.log(mean_train_metrics, step=self.example_counter)

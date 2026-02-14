@@ -90,6 +90,13 @@ def main(config: DictConfig):
         print('Setting eval_every to', config.eval_every - config.eval_every % config.batch_size)
         config.eval_every = config.eval_every - config.eval_every % config.batch_size
 
+    # ← THÊM: Thêm config mặc định cho save_every nếu chưa có
+    if not hasattr(config, 'save_every_epoch'):
+        config.save_every_epoch = True  # Mặc định lưu sau mỗi epoch
+    
+    if not hasattr(config, 'save_every_steps'):
+        config.save_every_steps = 0  # 0 = không lưu theo steps
+
     if 'FSDP' in config.trainer and config.fsdp_port is None:
         free_port = get_open_port()
         print('no FSDP port specified; using open port for FSDP:', free_port)
@@ -115,14 +122,14 @@ def main(config: DictConfig):
     model_kwargs = {'device_map': 'balanced'} if config.trainer == 'BasicTrainer' else {}
     policy_dtype = getattr(torch, config.model.policy_dtype)
     policy = transformers.AutoModelForCausalLM.from_pretrained(
-        config.model.name_or_path, low_cpu_mem_usage=True, torch_dtype=policy_dtype, **model_kwargs)
+        config.model.name_or_path, low_cpu_mem_usage=True, torch_dtype=policy_dtype, attn_implementation="sdpa", **model_kwargs)
     disable_dropout(policy)
 
     if config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'radpo'}:
         print('building reference model')
         reference_model_dtype = getattr(torch, config.model.reference_dtype)
         reference_model = transformers.AutoModelForCausalLM.from_pretrained(
-            config.model.name_or_path, low_cpu_mem_usage=True, torch_dtype=reference_model_dtype, **model_kwargs)
+            config.model.name_or_path, low_cpu_mem_usage=True, torch_dtype=reference_model_dtype, attn_implementation="sdpa", **model_kwargs)
         disable_dropout(reference_model)
     else:
         reference_model = None
