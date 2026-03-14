@@ -11,11 +11,11 @@
 #                   • Typically the SFT / base model used as reference
 #                     during DPO training — must match what the DPO trainer uses.
 # ─────────────────────────────────────────────────────────────────────────────
-dpo_model_name="/mnt/data/anhnh2220/dat/weighted-Ra_DPO/output/dpo_llama-8b-sft_ultra-feedback_03-10_22-41"   # ← frozen DPO checkpoint
-ref_model_name="/mnt/data/anhnh2220/dat/weighted-Ra_DPO/output/llama-8b-sft"   # ← reference / SFT model
+dpo_model_name="/mnt/data/anhnh2220/dat/weighted-Ra_DPO/output/qwen3-dpo"   # ← frozen DPO checkpoint
+ref_model_name="/mnt/data/anhnh2220/dat/weighted-Ra_DPO/output/qwen3-sft"   # ← reference / SFT model
 
 input_dir="/mnt/data/anhnh2220/dat/weighted-Ra_DPO/datasets/ultra-feedback"
-output_dir="/mnt/data/anhnh2220/dat/weighted-Ra_DPO/generated-data/ultra-feedback-gradient"
+output_dir="/mnt/data/anhnh2220/dat/weighted-Ra_DPO/generated-data/ultra-feedback-l2"
 
 # "normal" → no system prompt, prompt is passed through the model's chat template only.
 # Must match what your DPO trainer uses.

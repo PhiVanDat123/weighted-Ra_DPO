@@ -1,8 +1,8 @@
-name_or_path: /root/models/mistralai/Mistral-7B-Instruct-v0.1
-tokenizer_name_or_path: null
+name_or_path: /mnt/data/anhnh2220/dat/weighted-Ra_DPO/output/mistral-7b-sft
+tokenizer_name_or_path: /mnt/data/anhnh2220/dat/weighted-Ra_DPO/output/mistral-7b-sft
 archive: null
 block_name: MistralDecoderLayer
 
-policy_dtype: float32
-fsdp_policy_mp: null
+policy_dtype: bfloat16
+fsdp_policy_mp: bfloat16
 reference_dtype: float16

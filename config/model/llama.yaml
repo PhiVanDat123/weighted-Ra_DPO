@@ -1,0 +1,9 @@
+name_or_path: /mnt/data/anhnh2220/dat/weighted-Ra_DPO/output/llama-8b-sft
+#teacher_name_or_path: /mnt/datpv/DPO/TIS-DPO/output/llama-8b-dpo
+tokenizer_name_or_path: /mnt/data/anhnh2220/dat/weighted-Ra_DPO/output/llama-8b-sft
+archive: null
+block_name: LlamaDecoderLayer
+
+policy_dtype: bfloat16
+fsdp_policy_mp: bfloat16
+reference_dtype: float16

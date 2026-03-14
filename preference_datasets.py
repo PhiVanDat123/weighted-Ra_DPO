@@ -16,7 +16,31 @@ import numpy as np
 from typing import Dict, List, Optional, Iterator, Callable, Union, Tuple
 import json
 import random
+import re
 
+def convert_hh_to_llama3(prompt: str, tokenizer) -> str:
+    """
+    Convert format Human/Assistant sang Llama-3.1 chat template.
+    Input:  "Human: ...\n\nAssistant: "
+    Output: "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n...<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    """
+    # Parse các turn từ prompt
+    pattern = r'Human: (.*?)(?=\n\nAssistant:|\n\nHuman:|$)|Assistant: (.*?)(?=\n\nHuman:|\n\nAssistant:|$)'
+    matches = re.findall(pattern, prompt.strip(), re.DOTALL)
+    
+    messages = []
+    for human_turn, assistant_turn in matches:
+        if human_turn.strip():
+            messages.append({"role": "user", "content": human_turn.strip()})
+        if assistant_turn.strip():
+            messages.append({"role": "assistant", "content": assistant_turn.strip()})
+    
+    formatted = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True  # thêm assistant header ở cuối
+    )
+    return formatted
 
 def binary_weight_transform(nums, top_percent=100):
     sorted_nums = sorted(nums, reverse=True)
@@ -73,7 +97,7 @@ weight_transform_methods = {
 }
 
 
-def get_dataset(name: str, split: str, silent: bool = False, transform_config=None, cache_dir: str = None, base_data_dir: str = None, reverse_dataset: bool = False):
+def get_dataset(name: str, split: str, tokenizer=None, silent: bool = False, transform_config=None, cache_dir: str = None, base_data_dir: str = None, reverse_dataset: bool = False):
     """Load the dataset and convert it to the necessary format.
     
        The dataset is converted to a dictionary with the following structure:
@@ -154,7 +178,8 @@ def get_dataset(name: str, split: str, silent: bool = False, transform_config=No
     with open(file_path, 'r', encoding='utf-8') as f:
         for line in tqdm.tqdm(f, desc=f'Processing {name}', disable=silent):
             example = json.loads(line)
-            prompt = example['prompt']
+            #prompt = example['prompt']
+            prompt = convert_hh_to_llama3(example['prompt'], tokenizer)
             chosen = example['chosen']
             rejected = example['rejected']
             
@@ -177,7 +202,7 @@ def get_dataset(name: str, split: str, silent: bool = False, transform_config=No
             data[prompt]['pairs'].append((n_responses, n_responses + 1))
             data[prompt]['responses'].extend(responses)
             data[prompt]['sft_target'] = chosen
-            '''
+            
             # Process weights
             data[prompt]['rejected_weight'].append(apply_weight_transform(rejected_weight, negate=False))
             if rejected_weight is None:
@@ -186,7 +211,7 @@ def get_dataset(name: str, split: str, silent: bool = False, transform_config=No
             data[prompt]['chosen_weight'].append(apply_weight_transform(chosen_weight, negate=True))
             if chosen_weight is None:
                 data[prompt]['chosen_weight'] = None
-            '''
+            
     return data
 
 
@@ -251,16 +276,16 @@ def tokenize_batch_element(prompt: str, chosen: str, rejected: str, truncation_m
     if chosen_weight is not None:
         assert len(chosen_weight) == len(chosen_tokens['input_ids'])
     
-    assert tokenizer.eos_token_id not in prompt_tokens['input_ids'], f"Prompt contains EOS token: {prompt}"
+    #assert tokenizer.eos_token_id not in prompt_tokens['input_ids'], f"Prompt contains EOS token: {prompt}"
     assert tokenizer.eos_token_id not in chosen_tokens['input_ids'], f"Chosen response contains EOS token: {chosen}"
     assert tokenizer.eos_token_id not in rejected_tokens['input_ids'], f"Rejected response contains EOS token: {rejected}"
-
+    # assert eos đã có ở trên rồi, không cần assert lại
     chosen_tokens['input_ids'].append(tokenizer.eos_token_id)
     chosen_tokens['attention_mask'].append(1)
 
     rejected_tokens['input_ids'].append(tokenizer.eos_token_id)
     rejected_tokens['attention_mask'].append(1)
-
+    
     longer_response_length = max(len(chosen_tokens['input_ids']), len(rejected_tokens['input_ids']))
 
     # if combined sequence is too long, truncate the prompt
@@ -364,7 +389,7 @@ def get_batch_iterator(names: List[str],
         flat_data = []
         for name in names:
             truncation_mode = 'keep_end' if name == 'hh' else 'keep_start'
-            for prompt, data in get_dataset(name, split, silent=silent, cache_dir=cache_dir, transform_config=transform_config, base_data_dir=base_data_dir, reverse_dataset=reverse_dataset).items():
+            for prompt, data in get_dataset(name, split, tokenizer=tokenizer, silent=silent, cache_dir=cache_dir, transform_config=transform_config, base_data_dir=base_data_dir, reverse_dataset=reverse_dataset).items():
                 flat_data.append((prompt, data['responses'], data['pairs'], data['sft_target'], data['rejected_weight'], data['chosen_weight'], truncation_mode))
 
     collate_fn = get_collate_fn(tokenizer)

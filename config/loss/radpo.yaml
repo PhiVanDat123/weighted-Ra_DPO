@@ -25,3 +25,4 @@ is_cal_risk_distribution_logps: false
 
 # if true, use a uniform (maximum entropy) reference model
 reference_free: false
+use_triplet: true

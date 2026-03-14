@@ -140,7 +140,8 @@ def compute_kl_gradient_attribution(
         )[0]  # (B, L, D)
 
         # L1 norm over embedding dim → importance per token
-        importances = grads.abs().sum(dim=-1).float()   # (B, L)
+        #importances = grads.abs().sum(dim=-1).float()   # (B, L)
+        importances = grads.norm(p=2, dim=-1).float()
         importances = importances * attention_mask.float()
 
         return importances
